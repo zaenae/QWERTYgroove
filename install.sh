@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # QWERTYgroove installer (macOS).
-#   curl -fsSL https://raw.githubusercontent.com/zaenae/QWERTYgroove/main/install.sh | bash
+#   curl -fsSL https://zaenae.github.io/QWERTYgroove/install | bash
 set -uo pipefail
 
 REPO="zaenae/QWERTYgroove"

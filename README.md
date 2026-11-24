@@ -11,7 +11,7 @@ Works with Spotify, Apple Music, YouTube or anything else playing on your Mac, t
 Open Terminal and paste this:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zaenae/QWERTYgroove/main/install.sh | bash
+curl -fsSL https://zaenae.github.io/QWERTYgroove/install | bash
 ```
 
 It asks for your Mac password once. When it's done, press Y to open it.

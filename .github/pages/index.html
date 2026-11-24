@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QWERTYgroove</title>
+<style>
+  :root { --bg: #aebab8; --ink: #2a2d2f; --muted: #4f5759; --panel: #2e3133; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); }
+  body { display: flex; align-items: center; justify-content: center; padding: 24px 16px;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  main { width: 100%; max-width: 620px; text-align: center; }
+  img { width: 100%; max-width: 520px; height: auto; }
+  p { font-size: 18px; line-height: 1.45; margin: 26px 0 30px; text-wrap: balance; }
+  .cmd { display: flex; align-items: stretch; text-align: left; background: var(--panel); color: #e9eeec;
+    font: 14px/1.4 ui-monospace, "SF Mono", Menlo, monospace; }
+  .cmd code { flex: 1; padding: 14px 16px; overflow-x: auto; white-space: nowrap; }
+  .cmd button { border: 0; border-left: 1px solid #4a5352; background: transparent; color: #e9eeec; padding: 0 16px;
+    font: inherit; cursor: pointer; }
+  .cmd button:hover { background: #3a3e41; }
+  small { display: block; margin-top: 14px; color: var(--muted); font-size: 14px; }
+  a { color: var(--ink); }
+</style>
+</head>
+<body>
+<main>
+  <img src="logo.svg" alt="QWERTYgroove">
+  <p>Your MacBook keyboard light, flashing along to whatever you're listening to.</p>
+  <div class="cmd"><code id="c">curl -fsSL https://zaenae.github.io/QWERTYgroove/install | bash</code><button id="b">Copy</button></div>
+  <small>Paste it into Terminal. For M-series MacBooks with a backlit keyboard. · <a href="https://github.com/zaenae/QWERTYgroove">GitHub</a></small>
+</main>
+<script>
+  document.getElementById("b").onclick = async () => {
+    try { await navigator.clipboard.writeText(document.getElementById("c").textContent); document.getElementById("b").textContent = "Copied"; }
+    catch (e) { getSelection().selectAllChildren(document.getElementById("c")); }
+  };
+</script>
+</body>
+</html>
