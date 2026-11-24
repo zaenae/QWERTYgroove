@@ -5,16 +5,22 @@ set -uo pipefail
 
 REPO="zaenae/QWERTYgroove"
 BRANCH="main"
-APP_DIR="$HOME/.qwertygroove/app"
+QG="$HOME/.qwertygroove"
+APP_DIR="$QG/app"
+VENV="$QG/venv"
+UV="$QG/bin/uv"
+PY="$VENV/bin/python"
 BIN_DIR="$HOME/.local/bin"
-LOG="$HOME/.qwertygroove/install.log"
-TOTAL=6
+LOG="$QG/install.log"
+TOTAL=5
+HELPER_DRIVER="/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver"
 
-mkdir -p "$HOME/.qwertygroove"
+# Everything QWERTYgroove needs (its own Python included) lives in ~/.qwertygroove.
+# No Apple developer tools or Homebrew needed.
+export UV_PYTHON_INSTALL_DIR="$QG/python" UV_CACHE_DIR="$QG/cache/uv"
+
+mkdir -p "$QG/cache"
 : > "$LOG"
-# Use the Python that comes with macOS (Homebrew's Python refuses --user installs)
-if [ -x /usr/bin/python3 ]; then PY=/usr/bin/python3
-else PY="$(command -v python3 || echo python3)"; fi
 
 # ------------------------------------------------------------------ looks
 if [ -t 1 ]; then
@@ -112,74 +118,7 @@ fi
 ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
 ok "Thanks! Now sit back ☕"
 
-# 3 — the basics (Apple's free developer tools, then Homebrew)
-step "Getting your Mac ready"
-SWUPDATE=/usr/sbin/softwareupdate
-tools_ready() { xcode-select -p >/dev/null 2>&1 && [ -x "$(xcode-select -p)/usr/bin/git" ]; }
-
-install_tools_quietly() {         # same way Homebrew does it: Apple's updater, no pop-up
-  local flag="/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress" label
-  sudo -n touch "$flag"
-  label="$("$SWUPDATE" -l 2>/dev/null | grep -B 1 -E 'Command Line Tools' \
-          | awk -F'*' '/^ *\*/ {print $2}' | sed -e 's/^ *Label: //' -e 's/^ *//' | sort -V | tail -n1)"
-  if [ -n "$label" ]; then
-    sudo -n "$SWUPDATE" -i "$label" && sudo -n xcode-select --switch /Library/Developer/CommandLineTools
-  fi
-  sudo -n rm -f "$flag"
-  tools_ready
-}
-
-wait_for_popup_install() {        # backup: Apple's pop-up, and we wait here until it's done
-  for _ in $(seq 1 720); do tools_ready && return 0; sleep 5; done   # up to an hour
-  return 1
-}
-
-if tools_ready; then
-  ok "Apple's free tools are ready"
-else
-  info "Your Mac needs some free tools from Apple. This can take 5 to 10 minutes."
-  if ! run "Installing Apple's free tools" install_tools_quietly; then
-    xcode-select --install >/dev/null 2>&1 || true
-    info "A window popped up. Click ${B}Install${R}${D}, then ${B}Agree${R}${D}. I'll wait right here."
-    run "Waiting for Apple's installer to finish" wait_for_popup_install \
-      || fail "Apple's tools didn't finish installing." "Run the same command again and it will pick up where it left off."
-  fi
-fi
-
-BREW=""
-for b in "$(command -v brew 2>/dev/null || true)" /opt/homebrew/bin/brew /usr/local/bin/brew; do
-  if [ -n "$b" ] && [ -x "$b" ]; then BREW="$b"; break; fi
-done
-if [ -z "$BREW" ]; then
-  BREW_SCRIPT="$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
-    || fail "Couldn't download what's needed." "Check your internet connection and try again."
-  run "Installing a few more free tools (a few minutes)" env NONINTERACTIVE=1 /bin/bash -c "$BREW_SCRIPT" \
-    || fail "Couldn't get your Mac ready." "Run the same command again to retry."
-  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && BREW="$b" && break; done
-  [ -n "$BREW" ] || fail "Couldn't get your Mac ready." "Run the same command again to retry."
-else
-  ok "Everything else is ready"
-fi
-eval "$("$BREW" shellenv)"
-
-# 4 — audio helpers
-step "Setting up sound"
-run "Installing the sound helper" brew install --quiet blackhole-2ch switchaudio-osx \
-  || fail "Couldn't set up sound."
-# macOS only picks up the new sound helper after its sound service restarts.
-# Restarting just that service (a second of silence) avoids restarting the Mac.
-helper_ready() { SwitchAudioSource -a -t output 2>/dev/null | grep -qi blackhole; }
-switch_on() {
-  helper_ready && return 0
-  sudo -n killall coreaudiod 2>/dev/null || sudo -n launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null
-  for _ in $(seq 1 20); do sleep 0.5; helper_ready && return 0; done
-  return 1
-}
-if ! run "Switching it on" switch_on; then
-  info "It'll switch on the first time you play your music."
-fi
-
-# 5 — the app
+# 3 — the app, with its own Python
 step "Installing QWERTYgroove"
 TMP="$(mktemp -d)"
 LOCAL_DIR=""
@@ -195,13 +134,67 @@ else
 fi
 rm -rf "$APP_DIR"
 mv "$TMP" "$APP_DIR"
-run "Adding what it needs" "$PY" -m pip install --user --quiet --disable-pip-version-check numpy sounddevice pyobjc-core \
-  || fail "Couldn't install the app's Python libraries."
-if ! run "Setting up its window" "$PY" -m pip install --user --quiet --disable-pip-version-check pywebview; then
+
+if [ ! -x "$UV" ]; then          # uv: a small, fast tool that sets up Python (astral.sh/uv)
+  run "Getting the tools it needs" bash -c "curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR='$QG/bin' UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh" \
+    || fail "Couldn't download what's needed." "Check your internet connection and try again."
+fi
+run "Getting Python ready" "$UV" venv --managed-python --python 3.12 --clear --quiet "$VENV" \
+  || fail "Couldn't set up Python." "Check your internet connection and try again."
+run "Adding what it needs" "$UV" pip install --python "$PY" --quiet \
+    --only-binary numpy --only-binary pyobjc-core --only-binary sounddevice \
+    numpy sounddevice pyobjc-core \
+  || fail "Couldn't install what the app needs." "Check your internet connection and try again."
+if ! run "Setting up its window" "$UV" pip install --python "$PY" --quiet pywebview; then
   warn "It'll open in your web browser instead of its own window. Works just the same."
 fi
 
-# 6 — the command
+# 4 — the sound helper, so the app can hear your music
+step "Setting up sound"
+helper_ready() {
+  PYTHONPATH="$APP_DIR" "$PY" -c 'import sys
+from qwertygroove import coreaudio
+sys.exit(0 if any("blackhole" in n.lower() for _, n, _ in coreaudio.outputs()) else 1)' 2>/dev/null
+}
+
+install_helper() {   # BlackHole (free, open source), straight from its makers: checked before installing
+  local meta url sum pkg="$QG/cache/sound-helper.pkg"
+  meta="$(curl -fsSL https://formulae.brew.sh/api/cask/blackhole-2ch.json)" || return 1
+  url="$(printf '%s' "$meta" | "$PY" -c 'import sys, json; print(json.load(sys.stdin)["url"])')" || return 1
+  sum="$(printf '%s' "$meta" | "$PY" -c 'import sys, json; print(json.load(sys.stdin)["sha256"])')" || return 1
+  case "$url" in https://*) ;; *) echo "unexpected download address: $url"; return 1 ;; esac
+  echo "downloading $url"
+  curl -fsSL -o "$pkg" "$url" || return 1
+  if [ "$sum" != "no_check" ]; then
+    [ "$("$PY" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$pkg")" = "$sum" ] \
+      || { echo "download doesn't match its checksum"; rm -f "$pkg"; return 1; }
+  fi
+  pkgutil --check-signature "$pkg" | grep -q "Existential Audio" \
+    || { echo "installer isn't signed by Existential Audio"; rm -f "$pkg"; return 1; }
+  sudo -n /usr/sbin/installer -pkg "$pkg" -target / || return 1
+  rm -f "$pkg"
+}
+
+# macOS only picks up a new sound helper after its sound service restarts.
+# Restarting just that service (a second of silence) avoids restarting the Mac.
+switch_on() {
+  helper_ready && return 0
+  sudo -n killall coreaudiod 2>/dev/null || sudo -n launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null
+  for _ in $(seq 1 20); do sleep 0.5; helper_ready && return 0; done
+  return 1
+}
+
+if [ -d "$HELPER_DRIVER" ]; then
+  ok "The sound helper is already installed"
+else
+  run "Installing the sound helper" install_helper \
+    || fail "Couldn't set up sound." "Check your internet connection and run the same command again."
+fi
+if ! run "Switching it on" switch_on; then
+  info "It'll switch on the first time you play your music."
+fi
+
+# 5 — the command
 step "Finishing up"
 mkdir -p "$BIN_DIR"
 printf '#!/bin/sh\nexport PYTHONPATH="%s${PYTHONPATH:+:$PYTHONPATH}"\nexec "%s" -m qwertygroove "$@"\n' \

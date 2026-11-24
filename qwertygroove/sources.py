@@ -8,6 +8,7 @@ import wave
 
 import numpy as np
 
+from . import coreaudio
 from .analysis import SAMPLERATE, HOP
 
 CACHE = os.path.join(os.path.expanduser("~"), ".qwertygroove", "cache")
@@ -39,12 +40,44 @@ def _sd():
 # the real speakers/headphones. The output is switched back when stopped.
 # --------------------------------------------------------------------------
 
-def _switch_audio():
+def _tool():
+    """Older installs used the SwitchAudioSource tool; still used if macOS's
+    audio system can't be reached directly for some reason."""
     for p in (shutil.which("SwitchAudioSource"), "/opt/homebrew/bin/SwitchAudioSource",
               "/usr/local/bin/SwitchAudioSource"):
         if p and os.path.exists(p):
             return p
     return None
+
+
+def _run_tool(*args):
+    tool = _tool()
+    if not tool:
+        return ""
+    return subprocess.run([tool, *args], capture_output=True, text=True).stdout
+
+
+def can_switch():
+    return coreaudio.available() or _tool() is not None
+
+
+def current_output():
+    if coreaudio.available():
+        return coreaudio.current_output()
+    return _run_tool("-c", "-t", "output").strip() or None
+
+
+def output_names():
+    if coreaudio.available():
+        return [name for _, name, _ in coreaudio.outputs()]
+    return [o for o in _run_tool("-a", "-t", "output").splitlines() if o.strip()]
+
+
+def switch_output(name):
+    if coreaudio.available():
+        return coreaudio.switch_output(name)
+    _run_tool("-t", "output", "-s", name)
+    return True
 
 
 def _is_blackhole(name):
@@ -55,18 +88,14 @@ def real_output(sd):
     """(device index, name) of the real speakers/headphones. If the Mac's sound
     output was left on BlackHole (e.g. after a crash), switch it back first, so
     you can actually hear things."""
-    tool = _switch_audio()
-    current = None
-    if tool:
-        run = lambda *a: subprocess.run([tool, *a], capture_output=True, text=True).stdout
-        current = run("-c", "-t", "output").strip()
-        if not current or _is_blackhole(current):
-            real = [o for o in run("-a", "-t", "output").splitlines() if o.strip() and not _is_blackhole(o)]
-            if real:
-                current = next((o for o in real if "speaker" in o.lower()), real[0])
-                subprocess.run([tool, "-t", "output", "-s", current], capture_output=True)
-            else:
-                current = None
+    current = current_output() if can_switch() else None
+    if can_switch() and (not current or _is_blackhole(current)):
+        real = [o for o in output_names() if not _is_blackhole(o) and "multi" not in o.lower()]
+        if real:
+            current = next((o for o in real if coreaudio.is_built_in(o) or "speaker" in o.lower()), real[0])
+            switch_output(current)
+        else:
+            current = None
     devices = sd.query_devices()
     outputs = [(i, d["name"]) for i, d in enumerate(devices)
                if d["max_output_channels"] > 0 and not _is_blackhole(d["name"])]
@@ -105,57 +134,6 @@ BLUETOOTH_HINTS = ("airpods", "beats", "bluetooth", "buds", "bose", "sony wh", "
 BLUETOOTH_TYPICAL = 0.17          # typical real delay of Bluetooth earbuds (seconds)
 
 
-def _coreaudio_device_info(device_name):
-    """(is_bluetooth, extra latency in seconds) for an output, straight from macOS.
-    Returns (None, 0) if it can't be read (then we fall back to the name)."""
-    try:
-        import ctypes, ctypes.util, struct
-        ca_path, cf_path = ctypes.util.find_library("CoreAudio"), ctypes.util.find_library("CoreFoundation")
-        if not ca_path or not cf_path:
-            return None, 0.0
-        ca, cf = ctypes.cdll.LoadLibrary(ca_path), ctypes.cdll.LoadLibrary(cf_path)
-    except Exception:
-        return None, 0.0
-    try:
-        cc = lambda s: struct.unpack(">I", s.encode())[0]
-
-        class Address(ctypes.Structure):
-            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
-
-        get_size, get_data = ca.AudioObjectGetPropertyDataSize, ca.AudioObjectGetPropertyData
-        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-
-        def prop_u32(obj, sel, scope):
-            v, n = ctypes.c_uint32(0), ctypes.c_uint32(4)
-            addr = Address(cc(sel), cc(scope), 0)
-            return v.value if get_data(obj, ctypes.byref(addr), 0, None, ctypes.byref(n), ctypes.byref(v)) == 0 else None
-
-        addr = Address(cc("dev#"), cc("glob"), 0)
-        size = ctypes.c_uint32(0)
-        if get_size(1, ctypes.byref(addr), 0, None, ctypes.byref(size)) != 0:
-            return None, 0.0
-        ids = (ctypes.c_uint32 * (size.value // 4))()
-        if get_data(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ids) != 0:
-            return None, 0.0
-        for dev in ids:
-            name_ref, n = ctypes.c_void_p(), ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
-            naddr = Address(cc("lnam"), cc("glob"), 0)
-            if get_data(dev, ctypes.byref(naddr), 0, None, ctypes.byref(n), ctypes.byref(name_ref)) != 0 or not name_ref.value:
-                continue
-            buf = ctypes.create_string_buffer(256)
-            cf.CFStringGetCString(name_ref, buf, 256, 0x08000100)
-            cf.CFRelease(name_ref)
-            if buf.value.decode("utf-8", "ignore") != device_name:
-                continue
-            transport = prop_u32(dev, "tran", "glob")
-            bluetooth = transport in (cc("blue"), cc("blea"))
-            return bluetooth, 0.0
-    except Exception:
-        pass
-    return None, 0.0
-
-
 def out_latency(stream, device_name):
     """Seconds between handing sound to the speakers/earphones and hearing it."""
     try:
@@ -163,7 +141,7 @@ def out_latency(stream, device_name):
         lat = float(lat[1] if isinstance(lat, (tuple, list)) else lat)
     except Exception:
         lat = 0.02
-    bluetooth, _ = _coreaudio_device_info(device_name)
+    bluetooth = coreaudio.is_bluetooth(device_name)
     if bluetooth is None:                       # couldn't ask macOS: go by the name
         bluetooth = any(h in (device_name or "").lower() for h in BLUETOOTH_HINTS)
     if bluetooth and lat < 0.12:                # reported delay is too small to be real
@@ -197,7 +175,7 @@ def _helper_loaded(sd):
 
 def spotify_status():
     """(ready, message) for the app to show."""
-    if not _switch_audio():
+    if not can_switch():
         return False, NOT_SET_UP
     if not _helper_loaded(_sd()) and not os.path.exists(HELPER_DRIVER):
         return False, NOT_SET_UP
@@ -226,19 +204,19 @@ class SpotifySource:
 
     def __init__(self, push):
         sd = _sd()
-        if not _switch_audio():
+        if not can_switch():
             raise SourceError(NOT_SET_UP)
         if not _helper_loaded(sd):
             if not os.path.exists(HELPER_DRIVER):
                 raise SourceError(NOT_SET_UP)
             sd = _switch_on_helper()
-        self.tool = _switch_audio()
         out, original = real_output(sd)
         devices = sd.query_devices()
         bh = next((i for i, d in enumerate(devices)
                    if _is_blackhole(d["name"]) and d["max_input_channels"] > 0), None)
         if bh is None:
             raise SourceError("Couldn't hear your music. Try restarting your Mac.")
+        self.helper = devices[bh]["name"]                 # e.g. "BlackHole 2ch"
         self.original = original
         self.output = original
         self.subtitle = f"Sound goes to {original}"
@@ -257,10 +235,10 @@ class SpotifySource:
 
     def start(self):
         self.stream.start()
-        subprocess.run([self.tool, "-t", "output", "-s", "BlackHole 2ch"], capture_output=True)
+        switch_output(self.helper)
 
     def stop(self):
-        subprocess.run([self.tool, "-t", "output", "-s", self.original], capture_output=True)
+        switch_output(self.original)
         self.stream.stop()
         self.stream.close()
 

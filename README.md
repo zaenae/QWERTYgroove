@@ -29,13 +29,13 @@ It starts with a demo song. Click **Your groove**, put something on, and watch y
 - A MacBook with a backlit keyboard (M1 or newer)
 - macOS
 
-To hear your music, the installer adds [BlackHole](https://github.com/ExistentialAudio/BlackHole), a free audio driver. Your sound still plays through your speakers or headphones as normal.
+The installer keeps everything in one folder (`~/.qwertygroove`), including its own copy of Python, so you don't need Xcode or Homebrew. To hear your music it also adds [BlackHole](https://github.com/ExistentialAudio/BlackHole), a free audio driver, downloaded from its makers and checked before installing. Your sound still plays through your speakers or headphones as normal.
 
 ## Uninstall
 
 ```bash
 rm -rf ~/.qwertygroove ~/.local/bin/qwertygroove
-brew uninstall blackhole-2ch switchaudio-osx
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver && sudo killall coreaudiod
 ```
 
 ## Credits
