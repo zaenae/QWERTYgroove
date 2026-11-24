@@ -145,9 +145,6 @@ run "Adding what it needs" "$UV" pip install --python "$PY" --quiet \
     --only-binary numpy --only-binary pyobjc-core --only-binary sounddevice \
     numpy sounddevice pyobjc-core \
   || fail "Couldn't install what the app needs." "Check your internet connection and try again."
-if ! run "Setting up its window" "$UV" pip install --python "$PY" --quiet pywebview; then
-  warn "It'll open in your web browser instead of its own window. Works just the same."
-fi
 
 # 4 — the sound helper, so the app can hear your music
 step "Setting up sound"

@@ -1,5 +1,5 @@
-"""QWERTYgroove for Mac: a small local server for the interface, shown in its own
-window (pywebview) or, if that isn't available, in your web browser."""
+"""QWERTYgroove for Mac: a small local server for the interface, opened in your
+web browser (or its own window with --window, if pywebview is installed)."""
 import argparse
 import json
 import os
@@ -119,7 +119,8 @@ def make_handler(engine, info, watch):
 
 def main():
     p = argparse.ArgumentParser(prog="qwertygroove", description="Make your MacBook keyboard light dance to music.")
-    p.add_argument("--browser", action="store_true", help="open in the web browser instead of a window")
+    p.add_argument("--browser", action="store_true", help=argparse.SUPPRESS)   # the default now; kept for old habits
+    p.add_argument("--window", action="store_true", help="open in its own window (needs pywebview)")
     p.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--port", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--preview", action="store_true", help="don't touch the keyboard light")
@@ -155,12 +156,12 @@ def main():
     tty = sys.stdout.isatty()
     teal, dim, off = ("\033[38;5;43m", "\033[2m", "\033[0m") if tty else ("", "", "")
     print(f"\n  {teal}♪ QWERTYgroove is open.{off}")
-    print(f"  {dim}Close its window when you're done (or press Ctrl+C here).{off}\n")
+    print(f"  {dim}It opens in your browser. Close the tab when you're done (or press Ctrl+C here).{off}\n")
     if light_error:
         print(f"  {dim}Note: {light_error}{off}")
     try:
         window = None
-        if not (args.browser or args.no_open):
+        if args.window and not args.no_open:
             try:
                 import webview
                 window = webview.create_window("QWERTYgroove", url, width=900, height=760,
