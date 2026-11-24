@@ -1,8 +1,10 @@
 <p align="center"><img src="docs/logo.svg" width="560" alt="QWERTYgroove"></p>
 
-Makes your MacBook keyboard light flash along to whatever you're listening to. Kicks, snares and vocals light it up, and it goes dark between beats.
+Hit play and let your MacBook keyboard groove along. The backlight flashes to every kick, snare and vocal, and goes dark between beats.
 
 Works with Spotify, Apple Music, YouTube or anything else playing on your Mac, through speakers or headphones.
+
+Best with the lights down. In a dim room the keys really pop.
 
 ![QWERTYgroove](docs/screenshot.png)
 
