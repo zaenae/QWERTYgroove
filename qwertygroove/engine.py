@@ -4,7 +4,6 @@ import collections
 import queue
 import threading
 import time
-import time
 
 from . import sources
 from .analysis import Analyzer, SAMPLERATE, HOP
@@ -13,6 +12,8 @@ from .analysis import Analyzer, SAMPLERATE, HOP
 # this much earlier than the sound comes out.
 KEYBOARD_LAG = 0.015
 MAX_DELAY = 0.6
+# How often to check whether the Mac's sound output changed (earphones plugged in...)
+FOLLOW_EVERY = 0.4
 
 
 DEFAULTS = {"mode": "all", "sensitivity": 1.8, "punch": 1.6, "fade": None, "floor": 0.0}
@@ -39,6 +40,7 @@ class Engine:
         self.pending = collections.deque()
         self.view = None                         # what's showing right now: (light, envs, levels)
         threading.Thread(target=self._show_loop, daemon=True).start()
+        threading.Thread(target=self._follow_loop, daemon=True).start()
 
     # ---------------------------------------------------------------- control
     def start(self, kind):
@@ -61,9 +63,7 @@ class Engine:
                 while not self.chunks.empty():
                     self.chunks.get_nowait()          # drop leftovers from the last source
                 self.analyzer = Analyzer(self.settings, getattr(src, "samplerate", SAMPLERATE))
-                # wait until the sound actually comes out of the speakers/earphones,
-                # minus the moment the keyboard light itself takes to react
-                self.delay = min(MAX_DELAY, max(0.0, getattr(src, "out_latency", 0.0) - KEYBOARD_LAG))
+                self.delay = self._delay_for(src)
                 self.pending.clear()
                 self.source = src
                 self.running = True
@@ -103,6 +103,37 @@ class Engine:
     def _set_status(self, text):
         self.status = text
 
+    @staticmethod
+    def _delay_for(src):
+        """Wait until the sound actually comes out of the speakers/earphones,
+        minus the moment the keyboard light itself takes to react."""
+        return min(MAX_DELAY, max(0.0, getattr(src, "out_latency", 0.0) - KEYBOARD_LAG))
+
+    def _follow_loop(self):
+        """Keeps the sound and the light on whatever the Mac plays through:
+        earphones plugged in or out, AirPods connecting, another output picked."""
+        while True:
+            time.sleep(FOLLOW_EVERY)
+            src = self.source
+            if src is None or not self.running or self.busy or not hasattr(src, "follow"):
+                continue
+            try:
+                moved = src.follow()
+            except Exception as e:
+                if self.source is src:
+                    self.stop()
+                    self.error = str(e) or e.__class__.__name__
+                    self.status = "Stopped"
+                continue
+            if moved:
+                with self.lock:
+                    if self.source is not src:
+                        continue
+                    if src.samplerate != self.analyzer.samplerate:
+                        self.analyzer = Analyzer(self.settings, src.samplerate)
+                    self.delay = self._delay_for(src)     # e.g. Bluetooth earbuds lag more than speakers
+                    self.pending.clear()
+
     # ---------------------------------------------------------------- audio loop
     def _run(self):
         while self.running:
@@ -118,6 +149,10 @@ class Engine:
                     self.running = False
                     self.source = None
                     self.light.update(self.settings.get("floor", 0.0), None)
+                    try:
+                        src.stop()
+                    except Exception:
+                        pass
                 continue
             level = self.analyzer.feed(chunk)
             bands = self.analyzer.bands

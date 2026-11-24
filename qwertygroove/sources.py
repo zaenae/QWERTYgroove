@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 
@@ -23,15 +24,20 @@ class SourceError(Exception):
     pass
 
 
+_SD_LOCK = threading.Lock()
+
+
 def _sd():
     """sounddevice, with a fresh list of audio devices (so earphones or AirPods
-    plugged in after the app opened are found)."""
+    plugged in after the app opened are found). This closes any open stream, so
+    only call it when none is playing."""
     import sounddevice
-    try:
-        sounddevice._terminate()
-        sounddevice._initialize()
-    except Exception:
-        pass
+    with _SD_LOCK:
+        try:
+            sounddevice._terminate()
+            sounddevice._initialize()
+        except Exception:
+            pass
     return sounddevice
 
 
@@ -84,13 +90,43 @@ def _is_blackhole(name):
     return "blackhole" in (name or "").lower()
 
 
+def _is_combined(name):
+    """Multi-Output and aggregate devices (one may contain the helper itself)."""
+    n = (name or "").lower()
+    return "multi" in n or "aggregate" in n
+
+
+def _is_real(name):
+    """A real speaker or pair of earphones we can play through."""
+    return bool(name) and not _is_blackhole(name) and not _is_combined(name)
+
+
+PLUGGED_HINTS = ("headphone", "earphone", "headset", "usb", "airpods", "buds", "beats", "bluetooth")
+
+
+def _just_plugged_in(name):
+    """Earphones, a USB headset or Bluetooth earbuds (not a monitor or an app's
+    virtual device), for spotting ones that were just plugged in."""
+    transport = coreaudio.transport(name)
+    if transport is not None:
+        return transport in ("bltn", "usb ", "blue", "blea")
+    return any(h in name.lower() for h in PLUGGED_HINTS)
+
+
+def _find_output(sd, name):
+    for i, d in enumerate(sd.query_devices()):
+        if d["name"] == name and d["max_output_channels"] > 0:
+            return i
+    return None
+
+
 def real_output(sd):
     """(device index, name) of the real speakers/headphones. If the Mac's sound
     output was left on BlackHole (e.g. after a crash), switch it back first, so
     you can actually hear things."""
     current = current_output() if can_switch() else None
     if can_switch() and (not current or _is_blackhole(current)):
-        real = [o for o in output_names() if not _is_blackhole(o) and "multi" not in o.lower()]
+        real = [o for o in output_names() if _is_real(o)]
         if real:
             current = next((o for o in real if coreaudio.is_built_in(o) or "speaker" in o.lower()), real[0])
             switch_output(current)
@@ -174,10 +210,15 @@ def _helper_loaded(sd):
 
 
 def spotify_status():
-    """(ready, message) for the app to show."""
+    """(ready, message) for the app to show. Asks macOS directly, so it never
+    interrupts music that's already playing."""
     if not can_switch():
         return False, NOT_SET_UP
-    if not _helper_loaded(_sd()) and not os.path.exists(HELPER_DRIVER):
+    try:
+        listed = any(_is_blackhole(n) for n in output_names())
+    except Exception:
+        listed = False
+    if not listed and not os.path.exists(HELPER_DRIVER):
         return False, NOT_SET_UP
     return True, "Your keyboard follows anything you play."
 
@@ -201,8 +242,14 @@ def _switch_on_helper():
 class SpotifySource:
     kind = "spotify"
     title = "Your groove"
+    position = duration = None
 
     def __init__(self, push):
+        self.push = push
+        self.lock = threading.Lock()
+        self.playing = self.closed = False
+        self.used = []                               # outputs played through before, latest last
+        self.refused = None                          # earphones that wouldn't play: don't keep retrying
         sd = _sd()
         if not can_switch():
             raise SourceError(NOT_SET_UP)
@@ -210,16 +257,18 @@ class SpotifySource:
             if not os.path.exists(HELPER_DRIVER):
                 raise SourceError(NOT_SET_UP)
             sd = _switch_on_helper()
-        out, original = real_output(sd)
+        self._open(sd, *real_output(sd))
+        self.known = set(output_names())             # to spot earphones plugged in later
+
+    def _open(self, sd, out, name):
+        """Listen to the helper and pass the sound on to `out` (your speakers or earphones)."""
         devices = sd.query_devices()
         bh = next((i for i, d in enumerate(devices)
                    if _is_blackhole(d["name"]) and d["max_input_channels"] > 0), None)
         if bh is None:
             raise SourceError("Couldn't hear your music. Try restarting your Mac.")
         self.helper = devices[bh]["name"]                 # e.g. "BlackHole 2ch"
-        self.original = original
-        self.output = original
-        self.subtitle = f"Sound goes to {original}"
+        push = self.push
 
         def callback(indata, outdata, frames, time_info, status):
             outdata[:] = indata
@@ -227,20 +276,79 @@ class SpotifySource:
         self.stream, self.samplerate = _open(
             lambda rate: sd.Stream(device=(bh, out), channels=2, samplerate=rate, blocksize=HOP,
                                    dtype="float32", latency="low", callback=callback),
-            _rates(sd, out), original)
-        self.out_latency = out_latency(self.stream, original)
+            _rates(sd, out), name)
+        if getattr(self, "output", None):
+            self.used = [n for n in self.used if n != self.output] + [self.output]
+        self.output = name                                # also what it goes back to when you stop
+        self.subtitle = f"Sound goes to {name}"
+        self.out_latency = out_latency(self.stream, name)
 
     active = property(lambda self: self.stream.active)
-    position = duration = None
 
     def start(self):
-        self.stream.start()
-        switch_output(self.helper)
+        with self.lock:
+            self.stream.start()
+            switch_output(self.helper)
+            self.playing = True
+
+    def follow(self):
+        """Keeps your music coming through us when the Mac's output changes:
+        earphones plugged in or out, AirPods connecting, or another output
+        picked in the menu bar. Returns True if the sound moved somewhere new."""
+        if not self.playing or self.closed:
+            return False
+        current, names = current_output(), output_names()
+        target = None
+        if _is_real(current):                         # macOS (or you) picked an output, so the music skips us
+            target = current
+        elif names and self.output not in names:      # unplugged: back to what you used before
+            target = next((n for n in reversed(self.used) if n in names), "")
+        else:                                         # earphones plugged in, but macOS stayed on the helper
+            fresh = [n for n in names if n not in self.known and _is_real(n) and _just_plugged_in(n)]
+            if fresh:
+                target = fresh[-1]
+        if names:
+            self.known = set(names)
+        if target != self.refused:
+            self.refused = None
+        if target is None:
+            return False
+        with self.lock:
+            if self.closed:
+                return False
+            if target in (self.output, self.refused):  # nothing new to play through: just take the music back
+                switch_output(self.helper)
+                return False
+            old = self.output
+            self._close()
+            sd = _sd()
+            out = _find_output(sd, target) if target else None
+            if out is None:                           # unplugged, or not ready yet: whatever's there now
+                out, target = real_output(sd)
+            try:
+                self._open(sd, out, target)
+            except SourceError:                       # those won't play: carry on where we were
+                back = _find_output(sd, old)
+                if back is None:
+                    raise
+                self.refused = target
+                self._open(sd, back, old)
+            self.stream.start()
+            switch_output(self.helper)
+            return True
+
+    def _close(self):
+        try:
+            self.stream.abort()
+            self.stream.close()
+        except Exception:
+            pass
 
     def stop(self):
-        switch_output(self.original)
-        self.stream.stop()
-        self.stream.close()
+        with self.lock:
+            self.closed = True
+            switch_output(self.output)
+            self._close()
 
 
 # --------------------------------------------------------------------------
@@ -345,11 +453,18 @@ class DemoSource:
     kind = "demo"
 
     def __init__(self, push, progress=None):
-        sd = _sd()
-        device, self.output = real_output(sd)
-        song44, self.title, self.subtitle = get_demo(progress)
+        self.push = push
+        self.lock = threading.Lock()
+        self.playing = self.closed = False
+        self.refused = None                           # earphones that wouldn't play: don't keep retrying
+        self.song44, self.title, self.subtitle = get_demo(progress)
         self.pos = 0
+        sd = _sd()
+        self._open(sd, *real_output(sd))
+
+    def _open(self, sd, device, name):
         holder = {}
+        push = self.push
 
         def callback(outdata, frames, time_info, status):
             song = holder["song"]
@@ -361,21 +476,67 @@ class DemoSource:
                 push(chunk.mean(axis=1).astype(np.float32))
             if len(chunk) < frames:
                 raise sd.CallbackStop
-        def make(rate):
-            holder["song"] = resampled(song44, rate)
-            return sd.OutputStream(device=device, channels=song44.shape[1], samplerate=rate,
-                                   blocksize=HOP, dtype="float32", latency="low", callback=callback)
-        self.stream, self.samplerate = _open(make, _rates(sd, device), self.output)
-        self.song = holder["song"]
-        self.out_latency = out_latency(self.stream, self.output)
 
-    active = property(lambda self: self.stream.active)
+        def make(rate):
+            holder["song"] = resampled(self.song44, rate)
+            return sd.OutputStream(device=device, channels=self.song44.shape[1], samplerate=rate,
+                                   blocksize=HOP, dtype="float32", latency="low", callback=callback)
+        stream, rate = _open(make, _rates(sd, device), name)
+        old = getattr(self, "samplerate", rate)
+        self.pos = int(self.pos * rate / old)         # same point in the song at the new rate
+        self.stream, self.samplerate, self.song, self.output = stream, rate, holder["song"], name
+        self.out_latency = out_latency(stream, name)
+
+    # Playing until the song runs out (even for the moment it takes to move to
+    # new earphones, or if the ones it was playing to were just unplugged).
+    active = property(lambda self: not self.closed and self.pos < len(self.song))
     position = property(lambda self: min(self.pos, len(self.song)) / self.samplerate)
     duration = property(lambda self: len(self.song) / self.samplerate)
 
     def start(self):
-        self.stream.start()
+        with self.lock:
+            self.stream.start()
+            self.playing = True
+
+    def follow(self):
+        """Moves the song to whatever the Mac plays through now: earphones
+        plugged in or out, AirPods connecting, or another output picked in the
+        menu bar. It carries on from the same spot. True if it moved."""
+        if not self.playing or self.closed or not can_switch():
+            return False
+        target = current_output()
+        if target != self.refused:
+            self.refused = None
+        if not _is_real(target) or target in (self.output, self.refused):
+            return False
+        with self.lock:
+            if not self.active:                       # stopped, or the song has finished
+                return False
+            old = self.output
+            self._close()
+            sd = _sd()
+            device = _find_output(sd, target)
+            if device is None:
+                device, target = real_output(sd)
+            try:
+                self._open(sd, device, target)
+            except SourceError:                       # those won't play: carry on where we were
+                back = _find_output(sd, old)
+                if back is None:
+                    raise
+                self.refused = target
+                self._open(sd, back, old)
+            self.stream.start()
+            return True
+
+    def _close(self):
+        try:
+            self.stream.abort()
+            self.stream.close()
+        except Exception:
+            pass
 
     def stop(self):
-        self.stream.stop()
-        self.stream.close()
+        with self.lock:
+            self.closed = True
+            self._close()

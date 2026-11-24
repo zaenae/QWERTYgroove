@@ -128,6 +128,17 @@ def is_bluetooth(name):
     return None
 
 
+def transport(name):
+    """How an output is connected, as macOS's four-letter code ("bltn" built in,
+    "usb ", "blue" Bluetooth, "hdmi"...), or None if it can't be told."""
+    if not _libs():
+        return None
+    for _, n, t in outputs():
+        if n == name and t is not None:
+            return struct.pack(">I", t).decode("latin-1")
+    return None
+
+
 def is_built_in(name):
     for _, n, transport in outputs():
         if n == name:
